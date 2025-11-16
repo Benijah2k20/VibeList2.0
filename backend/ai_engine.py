@@ -32,13 +32,53 @@ The JSON must follow this schema (numbers in [0,1], tempo 40–220):
   "danceability_range": [<0-1>, <0-1>],
   "acousticness_range": [<0-1>, <0-1>],
   "genre_candidates": ["<up to 6 genres>"],
-  "keywords": ["<3-8 short search keywords (no artist names unless explicitly requested)>"]
+  "keywords": ["<3-8 short search keywords>"]
 }}
 
-Notes:
-- Favor CONCRETE Spotify-like genre names when possible: pop, rock, metal, death-metal, metalcore, hardcore, hip-hop, r-n-b, electronic, house, techno, indie-pop, alternative, ambient, chill, chillhop, lofi, jazz, soul, funk, trap, punk, folk, singer-songwriter, edm, drum-and-bass.
-- If the user asks for specific decades/substyles (e.g., "2000s R&B", "hardcore death metal for gym"), reflect that in genre_candidates and tempo/energy/danceability.
-- No commentary. Output JSON only.
+CRITICAL RULES:
+1. ONLY use these EXACT Spotify genre names (nothing else will work):
+   pop, dance-pop, indie-pop, synth-pop, electropop, k-pop, j-pop, mandopop,
+   rock, alt-rock, indie-rock, psych-rock, garage-rock, punk-rock, hard-rock,
+   metal, death-metal, black-metal, heavy-metal, metalcore, hardcore,
+   hip-hop, trap, rap, underground-hip-hop,
+   r-n-b, soul, funk, disco, neo-soul,
+   electronic, edm, house, deep-house, techno, trance, dubstep, drum-and-bass,
+   ambient, chill, chillhop, lo-fi, downtempo,
+   jazz, blues, gospel, reggae, dancehall, reggaeton, latin, salsa,
+   folk, singer-songwriter, acoustic, indie, alternative, emo, grunge
+
+2. NEVER suggest these genres (they bleed into everything):
+   country, contemporary-country, folk-rock (use 'folk' or 'rock' separately)
+
+3. Tempo guidelines:
+   - Sleep/study/chill: 60-90 BPM
+   - Walking/casual: 90-110 BPM  
+   - Workout/running: 120-140 BPM
+   - High-intensity/metal/EDM: 140-180 BPM
+
+4. Energy guidelines:
+   - Relaxing/sleep: 0.1-0.3
+   - Chill/studying: 0.3-0.5
+   - Normal listening: 0.5-0.7
+   - Workout/party: 0.7-0.9
+   - Intense/metal/hardcore: 0.85-1.0
+
+5. Valence (happiness) guidelines:
+   - Sad/melancholic: 0.1-0.3
+   - Reflective/moody: 0.3-0.5
+   - Neutral: 0.4-0.6
+   - Upbeat/happy: 0.6-0.8
+   - Euphoric/party: 0.8-1.0
+
+6. For specific styles:
+   - "brutal death metal" → ["death-metal", "metalcore", "hardcore"], energy: [0.9, 1.0], tempo: 160-180
+   - "chill lofi beats" → ["chillhop", "lo-fi", "ambient"], energy: [0.2, 0.4], tempo: 70-90
+   - "90s hip-hop" → ["hip-hop", "rap"], energy: [0.5, 0.7], tempo: 85-95
+   - "gym pump up" → ["edm", "trap", "electronic"], energy: [0.8, 0.95], tempo: 130-150
+
+7. Keywords should describe SOUND/VIBE, not artist names:
+   Good: ["aggressive", "heavy", "distorted", "fast"]
+   Bad: ["metallica", "slayer"] (unless user explicitly requests an artist)
 
 User vibe: "{vibe}"
 """
