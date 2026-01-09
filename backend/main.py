@@ -185,11 +185,12 @@ def generate_playlist(
     Generate playlist recommendations (does NOT create Spotify playlist yet).
     
     Returns track URIs and info for user to review/thumbs up or down.
+    ALSO returns a replacement pool for instant track swapping.
     
     Parameters:
     - username: User's identifier
     - prompt: Vibe description (e.g., "rooftop pregame")
-    - limit: Number of tracks (default 15)
+    - limit: Number of tracks to show (default 15)
     - energy: Optional energy override (0-1)
     - genres: Comma-separated genre names
     - artists: Comma-separated artist IDs
@@ -210,26 +211,42 @@ def generate_playlist(
         # Step 3: Get Spotify client
         sp = get_spotify(username)
         
-        # Step 4: Generate recommendations
+        # Step 4: Generate LARGE pool of recommendations (3-4x requested)
+        # This gives us a replacement pool for thumbs-down swaps
+        pool_size = max(50, limit * 3)
+        print(f"[Generate] Requesting {pool_size} tracks for pool (showing top {limit})")
+        
         track_uris = recommend_tracks(
             sp=sp,
             vibe_params=vibe_params,
-            n=limit,
+            n=pool_size,
             user_artist_ids=user_artist_ids if user_artist_ids else None,
             user_genres=user_genres if user_genres else None,
             energy_override=energy,
+            only_selected_artists=only_selected_artists,
         )
         
         if not track_uris:
             raise HTTPException(400, "No tracks found matching your criteria. Try adjusting your vibe or selections.")
         
-        # Step 5: Fetch track details for frontend
-        tracks = get_track_info(sp, track_uris[:limit])
+        # Step 5: Fetch track details for ALL tracks in pool
+        all_tracks = get_track_info(sp, track_uris[:pool_size])
+        
+        if not all_tracks:
+            raise HTTPException(400, "Failed to fetch track information")
+        
+        # Step 6: Split into preview and replacement pool
+        preview_tracks = all_tracks[:limit]
+        replacement_pool = all_tracks[limit:] if len(all_tracks) > limit else []
+        
+        print(f"[Generate] Returning {len(preview_tracks)} preview tracks + {len(replacement_pool)} replacements")
         
         return {
-            "tracks": tracks,
+            "tracks": preview_tracks,
+            "replacement_pool": replacement_pool,
             "vibe_params": vibe_params,
-            "count": len(tracks),
+            "count": len(preview_tracks),
+            "pool_size": len(all_tracks),
         }
     
     except HTTPException:

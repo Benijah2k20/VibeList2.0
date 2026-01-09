@@ -36,9 +36,12 @@ def recommend_tracks(
     user_artist_ids: Optional[List[str]] = None,
     user_genres: Optional[List[str]] = None,
     energy_override: Optional[float] = None,
+    only_selected_artists: bool = False,
 ) -> List[str]:
     """
     Generate playlist recommendations based on vibe parameters.
+    
+    NEW STRATEGY: Search-first approach with artist control
     
     Args:
         sp: Authenticated Spotify client
@@ -47,11 +50,17 @@ def recommend_tracks(
         user_artist_ids: Optional list of artist IDs to use as seeds/filters
         user_genres: Optional list of genres to use (overrides AI genres)
         energy_override: Optional energy level from user slider (0-1)
+        only_selected_artists: If True, ONLY return tracks from selected artists
     
     Returns:
         List of track URIs
     """
     print(f"\n[Recommend] Starting recommendation for {n} tracks")
+    
+    if only_selected_artists:
+        print(f"[Recommend] ONLY SELECTED ARTISTS MODE - Will only return tracks from chosen artists")
+    elif user_artist_ids:
+        print(f"[Recommend] INCLUDE ARTISTS MODE - Will prioritize {len(user_artist_ids)} selected artists")
     
     # Parse vibe parameters
     energy_range = vibe_params.get("energy_range", [0.5, 0.7])
@@ -81,32 +90,57 @@ def recommend_tracks(
         genres = _normalize_genres(sp, ai_genres)
         print(f"[Recommend] AI genres: {genres}")
     
-    # Build seed parameters (max 5 total seeds)
-    seed_artists = []
-    seed_genres = []
-    seed_tracks = []
+    # === ONLY SELECTED ARTISTS MODE ===
+    if only_selected_artists and user_artist_ids:
+        print(f"[Recommend] Searching ONLY within {len(user_artist_ids)} selected artist(s)")
+        
+        # Get extensive catalog from selected artists
+        artist_tracks = _get_artist_extensive_catalog(sp, user_artist_ids, max_per_artist=50)
+        
+        if not artist_tracks:
+            print("[Recommend] WARNING: No tracks found from selected artists!")
+            return []
+        
+        print(f"[Recommend] Found {len(artist_tracks)} tracks from selected artists")
+        
+        # Score these tracks by vibe match
+        features_map = _fetch_audio_features(sp, artist_tracks)
+        scored_tracks = []
+        
+        for uri in artist_tracks:
+            track_id = uri.split(":")[-1]
+            features = features_map.get(track_id)
+            
+            if not features:
+                scored_tracks.append((uri, 0.5, {}))
+            else:
+                score = _calculate_vibe_score(
+                    features,
+                    target_energy=target_energy,
+                    target_valence=target_valence,
+                    target_danceability=target_danceability,
+                    target_acousticness=target_acousticness,
+                    target_tempo=tempo_bpm,
+                )
+                scored_tracks.append((uri, score, features))
+        
+        # Sort by score
+        scored_tracks.sort(key=lambda x: x[1], reverse=True)
+        print(f"[Recommend] Top 5 scores: {[round(s, 2) for _, s, _ in scored_tracks[:5]]}")
+        
+        # Return top N
+        final_uris = [uri for uri, _, _ in scored_tracks[:n]]
+        print(f"[Recommend] Returning {len(final_uris)} tracks (only from selected artists)")
+        return final_uris
     
-    # Priority 1: User-selected artists (if any)
-    if user_artist_ids:
-        seed_artists = user_artist_ids[:2]  # Max 2 artist seeds
-        print(f"[Recommend] Using {len(seed_artists)} artist seeds")
+    # === NORMAL MODE (Include selected artists) ===
     
-    # Priority 2: Genres
-    remaining_seeds = 5 - len(seed_artists)
-    if genres and remaining_seeds > 0:
-        seed_genres = genres[:remaining_seeds]
-        print(f"[Recommend] Using {len(seed_genres)} genre seeds")
-    
-    # Ensure we have at least one seed
-    if not seed_artists and not seed_genres:
-        seed_genres = ["pop"]  # Safe fallback
-        print("[Recommend] No seeds provided, using 'pop' as fallback")
-    
-    # STEP 1: Call Spotify recommendations API
-    candidate_uris = _fetch_recommendations(
+    # STEP 1: Try Spotify recommendations API (may fail in Dev Mode, that's OK)
+    print("[Recommend] Attempting Spotify Recommendations API...")
+    rec_tracks = _fetch_recommendations(
         sp,
-        seed_artists=seed_artists,
-        seed_genres=seed_genres,
+        seed_artists=user_artist_ids[:2] if user_artist_ids else [],
+        seed_genres=genres[:3] if genres else [],
         target_energy=target_energy,
         target_valence=target_valence,
         target_danceability=target_danceability,
@@ -114,43 +148,51 @@ def recommend_tracks(
         target_tempo=tempo_bpm,
         limit=100,
     )
+    print(f"[Recommend] Recommendations API returned {len(rec_tracks)} tracks")
     
-    print(f"[Recommend] Received {len(candidate_uris)} candidates from Spotify")
+    # STEP 2: INTELLIGENT SEARCH - This is our main source now
+    print("[Recommend] Running intelligent vibe-based search...")
+    search_tracks = _intelligent_search(
+        sp,
+        vibe_params=vibe_params,
+        genres=genres,
+        user_artist_ids=user_artist_ids,
+        limit=100
+    )
+    print(f"[Recommend] Intelligent search returned {len(search_tracks)} tracks")
     
-    # STEP 2: If we have selected artists, guarantee some of their tracks
+    # STEP 3: Get EXTENSIVE tracks from selected artists (if specified)
+    artist_tracks = []
     if user_artist_ids:
-        artist_tracks = _get_artist_tracks(sp, user_artist_ids, max_per_artist=10)
-        candidate_uris.extend(artist_tracks)
-        candidate_uris = list(dict.fromkeys(candidate_uris))  # Remove duplicates
-        print(f"[Recommend] Added artist tracks, total candidates: {len(candidate_uris)}")
+        # Get MORE tracks from selected artists to ensure they appear
+        artist_tracks = _get_artist_extensive_catalog(sp, user_artist_ids, max_per_artist=30)
+        print(f"[Recommend] Added {len(artist_tracks)} tracks from selected artists")
     
-    # STEP 2.5: If recommendations API failed, use search as fallback
-    if not candidate_uris:
-        print("[Recommend] Recommendations API failed, using search fallback...")
-        search_tracks = _search_fallback(sp, vibe_params, genres, user_artist_ids, limit=n*3)
-        candidate_uris.extend(search_tracks)
-        candidate_uris = list(dict.fromkeys(candidate_uris))
-        print(f"[Recommend] Search fallback returned {len(candidate_uris)} candidates")
+    # STEP 4: Combine all sources and remove duplicates
+    all_candidates = rec_tracks + search_tracks + artist_tracks
+    candidate_uris = list(dict.fromkeys(all_candidates))  # Remove duplicates, preserve order
+    
+    print(f"[Recommend] Total unique candidates: {len(candidate_uris)}")
     
     if not candidate_uris:
         print("[Recommend] WARNING: No candidates found!")
         return []
     
-    # STEP 3: Fetch audio features for all candidates
+    # STEP 5: Fetch audio features for all candidates
     features_map = _fetch_audio_features(sp, candidate_uris)
     
-    # STEP 4: Score each track by vibe match
+    # STEP 6: Score each track by vibe match (with artist boost)
     scored_tracks = []
     for uri in candidate_uris:
         track_id = uri.split(":")[-1]
         features = features_map.get(track_id)
         
-        # If no features available (403 error), give neutral score
+        # If no features available, give neutral score
         if not features:
-            scored_tracks.append((uri, 0.5, {}))
+            base_score = 0.5
         else:
             # Calculate vibe match score (0-1, higher is better)
-            score = _calculate_vibe_score(
+            base_score = _calculate_vibe_score(
                 features,
                 target_energy=target_energy,
                 target_valence=target_valence,
@@ -158,16 +200,39 @@ def recommend_tracks(
                 target_acousticness=target_acousticness,
                 target_tempo=tempo_bpm,
             )
-            scored_tracks.append((uri, score, features))
+        
+        # BOOST SCORE for selected artists (so they appear prominently)
+        final_score = base_score
+        if user_artist_ids:
+            # Check if this track is from a selected artist
+            # We'll verify this in the diversity step, but boost here too
+            artist_tracks_set = set(artist_tracks)
+            if uri in artist_tracks_set:
+                # Boost by 0.15 (significant but not overwhelming)
+                final_score = min(1.0, base_score + 0.15)
+                print(f"[Score] Boosted artist track: {uri.split(':')[-1]} from {base_score:.2f} to {final_score:.2f}")
+        
+        scored_tracks.append((uri, final_score, features))
     
     # Sort by score (best first)
     scored_tracks.sort(key=lambda x: x[1], reverse=True)
     print(f"[Recommend] Top 5 scores: {[round(s, 2) for _, s, _ in scored_tracks[:5]]}")
     
-    # STEP 5: Apply diversity rules and select top N
+    # STEP 7: Apply diversity rules with artist priority
     final_uris = _apply_diversity(sp, scored_tracks, n, user_artist_ids)
     
     print(f"[Recommend] Returning {len(final_uris)} tracks")
+    
+    # STEP 8: VERIFY selected artists are included
+    if user_artist_ids and not only_selected_artists:
+        artist_count = _count_artist_tracks_in_results(sp, final_uris, user_artist_ids)
+        print(f"[Recommend] Selected artists appear {artist_count} times in final results")
+        
+        if artist_count == 0:
+            print(f"[Recommend] WARNING: No tracks from selected artists in results! Forcing inclusion...")
+            # Force include at least 3 tracks from selected artists
+            final_uris = _force_artist_inclusion(sp, scored_tracks, final_uris, user_artist_ids, min_count=3)
+    
     return final_uris
 
 
@@ -279,64 +344,409 @@ def _fetch_recommendations(
     return []
 
 
-def _search_fallback(sp: Spotify, vibe_params: dict, genres: List[str], artist_ids: Optional[List[str]], limit: int = 50) -> List[str]:
+def _intelligent_search(
+    sp: Spotify,
+    vibe_params: dict,
+    genres: List[str],
+    user_artist_ids: Optional[List[str]],
+    limit: int = 100
+) -> List[str]:
     """
-    Fallback when recommendations API fails.
-    Uses search API to find tracks matching the vibe.
+    Intelligently search for tracks matching the vibe.
+    Uses multiple search strategies to cast a wide net.
+    
+    This is now the PRIMARY method for finding tracks, not a fallback.
     """
     tracks = []
+    seen_uris = set()
     
-    # Build search queries based on vibe
-    queries = []
+    # Extract vibe parameters
+    mood = vibe_params.get('mood', '')
+    keywords = vibe_params.get('keywords', [])
+    scene = vibe_params.get('scene', '')
+    energy_range = vibe_params.get('energy_range', [0.5, 0.7])
     
-    # Use genres for search
+    # Determine energy level descriptor
+    avg_energy = sum(energy_range) / 2
+    if avg_energy > 0.7:
+        energy_word = "energetic"
+    elif avg_energy < 0.4:
+        energy_word = "chill"
+    else:
+        energy_word = "moderate"
+    
+    print(f"[Search] Building queries for mood='{mood}', energy={energy_word}, keywords={keywords}")
+    
+    # STRATEGY 1: Genre + Mood combinations
     if genres:
         for genre in genres[:3]:  # Top 3 genres
-            queries.append(f'genre:{genre}')
+            queries = [
+                f"{genre} {mood}",
+                f"{genre} {energy_word}",
+                f"{genre} {scene}" if scene else None,
+            ]
+            for query in queries:
+                if query and len(tracks) < limit:
+                    found = _search_spotify(sp, query.strip(), seen_uris, max_tracks=20)
+                    tracks.extend(found)
+                    print(f"[Search] Query '{query}' found {len(found)} tracks")
     
-    # Use mood/keywords
-    keywords = vibe_params.get('keywords', [])
-    mood = vibe_params.get('mood', '')
-    if keywords:
-        queries.append(' '.join(keywords[:2]))
-    elif mood:
-        queries.append(mood)
+    # STRATEGY 2: Mood + Keywords combinations
+    if mood and keywords:
+        query = f"{mood} {' '.join(keywords[:2])}"
+        if len(tracks) < limit:
+            found = _search_spotify(sp, query, seen_uris, max_tracks=20)
+            tracks.extend(found)
+            print(f"[Search] Query '{query}' found {len(found)} tracks")
     
-    # Default fallback queries
-    if not queries:
-        queries = ['popular music', 'top hits']
+    # STRATEGY 3: Scene-based search
+    if scene and len(tracks) < limit:
+        queries = [
+            scene,
+            f"{scene} music",
+            f"{energy_word} {scene}",
+        ]
+        for query in queries:
+            if len(tracks) < limit:
+                found = _search_spotify(sp, query, seen_uris, max_tracks=15)
+                tracks.extend(found)
+                print(f"[Search] Query '{query}' found {len(found)} tracks")
     
-    # Search for tracks
-    for query in queries[:5]:  # Max 5 queries
-        try:
-            result = sp.search(q=query, type='track', limit=20)
-            for track in result.get('tracks', {}).get('items', []):
-                if track and track.get('uri'):
-                    tracks.append(track['uri'])
-                    if len(tracks) >= limit:
-                        break
-            if len(tracks) >= limit:
-                break
-        except Exception as e:
-            print(f"[Search] Query '{query}' failed: {e}")
-            continue
+    # STRATEGY 4: Pure mood/keyword search
+    if len(tracks) < limit and keywords:
+        for keyword in keywords[:3]:
+            if len(tracks) < limit:
+                found = _search_spotify(sp, keyword, seen_uris, max_tracks=15)
+                tracks.extend(found)
+                print(f"[Search] Query '{keyword}' found {len(found)} tracks")
     
+    # STRATEGY 5: Related artists (if user selected specific artists)
+    if user_artist_ids and len(tracks) < limit:
+        print(f"[Search] Searching related artists...")
+        related_tracks = _search_related_artists(sp, user_artist_ids, seen_uris, max_tracks=30)
+        tracks.extend(related_tracks)
+        print(f"[Search] Related artists found {len(related_tracks)} tracks")
+    
+    # STRATEGY 6: Playlist mining (search for playlists matching the vibe)
+    if len(tracks) < limit:
+        print(f"[Search] Mining playlists...")
+        playlist_query = f"{mood} {' '.join(genres[:2])}" if genres else mood
+        playlist_tracks = _mine_playlists(sp, playlist_query, seen_uris, max_tracks=30)
+        tracks.extend(playlist_tracks)
+        print(f"[Search] Playlist mining found {len(playlist_tracks)} tracks")
+    
+    # STRATEGY 7: Fallback to genre-only if we're still short
+    if len(tracks) < limit // 2:  # If we have less than half needed
+        print(f"[Search] Running fallback genre search...")
+        for genre in genres[:2]:
+            if len(tracks) < limit:
+                found = _search_spotify(sp, f"genre:{genre}", seen_uris, max_tracks=30)
+                tracks.extend(found)
+    
+    print(f"[Search] Total tracks found: {len(tracks)}")
     return tracks[:limit]
 
 
-def _get_artist_tracks(sp: Spotify, artist_ids: List[str], max_per_artist: int = 5) -> List[str]:
-    """Get top tracks from selected artists."""
+def _search_spotify(sp: Spotify, query: str, seen_uris: set, max_tracks: int = 20) -> List[str]:
+    """
+    Execute a single Spotify search query and return unique track URIs.
+    """
+    if not query or not query.strip():
+        return []
+    
+    try:
+        result = sp.search(q=query, type='track', limit=max_tracks, market='US')
+        tracks = []
+        for track in result.get('tracks', {}).get('items', []):
+            if track and track.get('uri'):
+                uri = track['uri']
+                if uri not in seen_uris:
+                    tracks.append(uri)
+                    seen_uris.add(uri)
+        return tracks
+    except Exception as e:
+        print(f"[Search] Query '{query}' failed: {e}")
+        return []
+
+
+def _search_related_artists(sp: Spotify, artist_ids: List[str], seen_uris: set, max_tracks: int = 30) -> List[str]:
+    """
+    Find tracks from artists related to the user's selected artists.
+    """
     tracks = []
-    for artist_id in artist_ids[:5]:  # Max 5 artists
+    for artist_id in artist_ids[:2]:  # Limit to first 2 artists
         try:
-            result = sp.artist_top_tracks(artist_id, country="US")
-            for track in result.get("tracks", [])[:max_per_artist]:
-                if track.get("uri"):
-                    tracks.append(track["uri"])
+            # Get related artists
+            result = sp.artist_related_artists(artist_id)
+            related = result.get('artists', [])[:5]  # Top 5 related
+            
+            # Get top tracks from each related artist
+            for related_artist in related:
+                if len(tracks) >= max_tracks:
+                    break
+                try:
+                    top_tracks = sp.artist_top_tracks(related_artist['id'], country='US')
+                    for track in top_tracks.get('tracks', [])[:3]:  # Top 3 from each
+                        if track.get('uri'):
+                            uri = track['uri']
+                            if uri not in seen_uris:
+                                tracks.append(uri)
+                                seen_uris.add(uri)
+                except:
+                    continue
         except Exception as e:
-            print(f"[Artist] Failed to get tracks for {artist_id}: {e}")
+            print(f"[Search] Related artists search failed for {artist_id}: {e}")
+            continue
     
     return tracks
+
+
+def _mine_playlists(sp: Spotify, query: str, seen_uris: set, max_tracks: int = 30) -> List[str]:
+    """
+    Search for playlists matching the vibe and extract their tracks.
+    """
+    tracks = []
+    try:
+        # Search for playlists
+        result = sp.search(q=query, type='playlist', limit=3)  # Top 3 playlists
+        playlists = result.get('playlists', {}).get('items', [])
+        
+        for playlist in playlists:
+            if len(tracks) >= max_tracks:
+                break
+            
+            try:
+                # Get playlist tracks
+                playlist_id = playlist['id']
+                playlist_tracks = sp.playlist_tracks(playlist_id, limit=20)
+                
+                for item in playlist_tracks.get('items', []):
+                    if len(tracks) >= max_tracks:
+                        break
+                    
+                    track = item.get('track')
+                    if track and track.get('uri'):
+                        uri = track['uri']
+                        if uri not in seen_uris:
+                            tracks.append(uri)
+                            seen_uris.add(uri)
+            except:
+                continue
+                
+    except Exception as e:
+        print(f"[Search] Playlist mining failed: {e}")
+    
+    return tracks
+
+
+def _get_artist_tracks(sp: Spotify, artist_ids: List[str], max_per_artist: int = 15) -> List[str]:
+    """
+    Get tracks from selected artists.
+    Now includes top tracks AND album deep cuts for better variety.
+    
+    NOTE: This is the lighter version. For extensive catalog, use _get_artist_extensive_catalog.
+    """
+    tracks = []
+    for artist_id in artist_ids[:5]:  # Max 5 artists
+        artist_tracks = []
+        
+        try:
+            # Get top tracks (most popular)
+            result = sp.artist_top_tracks(artist_id, country="US")
+            for track in result.get("tracks", [])[:8]:  # Top 8 tracks
+                if track.get("uri"):
+                    artist_tracks.append(track["uri"])
+        except Exception as e:
+            print(f"[Artist] Failed to get top tracks for {artist_id}: {e}")
+        
+        # Also get some album tracks for deeper cuts
+        try:
+            albums = sp.artist_albums(artist_id, limit=5, album_type='album')
+            for album in albums.get('items', [])[:3]:  # Top 3 albums
+                album_tracks = sp.album_tracks(album['id'], limit=10)
+                for track in album_tracks.get('items', [])[:3]:  # 3 tracks per album
+                    if track.get('uri'):
+                        artist_tracks.append(track['uri'])
+                        if len(artist_tracks) >= max_per_artist:
+                            break
+                if len(artist_tracks) >= max_per_artist:
+                    break
+        except Exception as e:
+            print(f"[Artist] Failed to get album tracks for {artist_id}: {e}")
+        
+        tracks.extend(artist_tracks[:max_per_artist])
+    
+    return tracks
+
+
+def _get_artist_extensive_catalog(sp: Spotify, artist_ids: List[str], max_per_artist: int = 50) -> List[str]:
+    """
+    Get EXTENSIVE tracks from selected artists for "only artist" mode or heavy inclusion.
+    Searches deeper into their catalog for variety.
+    """
+    tracks = []
+    
+    for artist_id in artist_ids[:5]:  # Max 5 artists
+        artist_tracks = []
+        
+        try:
+            # Get artist name for logging
+            artist_info = sp.artist(artist_id)
+            artist_name = artist_info.get('name', artist_id)
+            print(f"[Artist] Fetching extensive catalog for {artist_name}...")
+            
+            # 1. Top tracks (always good)
+            result = sp.artist_top_tracks(artist_id, country="US")
+            for track in result.get("tracks", []):
+                if track.get("uri"):
+                    artist_tracks.append(track["uri"])
+            
+            # 2. Recent albums (singles, albums, compilations)
+            albums_result = sp.artist_albums(
+                artist_id, 
+                limit=20,  # Get more albums
+                album_type='album,single,compilation'
+            )
+            
+            for album in albums_result.get('items', []):
+                if len(artist_tracks) >= max_per_artist:
+                    break
+                
+                try:
+                    # Get tracks from this album
+                    album_tracks = sp.album_tracks(album['id'], limit=50)
+                    for track in album_tracks.get('items', []):
+                        if track.get('uri'):
+                            artist_tracks.append(track['uri'])
+                            if len(artist_tracks) >= max_per_artist:
+                                break
+                except:
+                    continue
+            
+            # Remove duplicates
+            artist_tracks = list(dict.fromkeys(artist_tracks))
+            
+            print(f"[Artist] Got {len(artist_tracks)} tracks from {artist_name}")
+            tracks.extend(artist_tracks[:max_per_artist])
+            
+        except Exception as e:
+            print(f"[Artist] Failed to get extensive catalog for {artist_id}: {e}")
+    
+    return tracks
+
+
+def _count_artist_tracks_in_results(sp: Spotify, track_uris: List[str], artist_ids: List[str]) -> int:
+    """
+    Count how many tracks in the results are from the selected artists.
+    """
+    if not track_uris or not artist_ids:
+        return 0
+    
+    count = 0
+    artist_ids_set = set(artist_ids)
+    
+    try:
+        # Get track info
+        track_ids = [uri.split(":")[-1] for uri in track_uris[:50]]  # Limit for performance
+        result = sp.tracks(track_ids)
+        
+        for track in result.get("tracks", []):
+            if not track:
+                continue
+            
+            # Check if any of the track's artists match selected artists
+            track_artist_ids = [a["id"] for a in track.get("artists", [])]
+            if any(aid in artist_ids_set for aid in track_artist_ids):
+                count += 1
+    
+    except Exception as e:
+        print(f"[Artist] Failed to count artist tracks: {e}")
+    
+    return count
+
+
+def _force_artist_inclusion(
+    sp: Spotify,
+    scored_tracks: List[tuple],
+    current_results: List[str],
+    artist_ids: List[str],
+    min_count: int = 3
+) -> List[str]:
+    """
+    Ensure at least min_count tracks from selected artists appear in results.
+    If not enough, replace lowest-scoring non-artist tracks with artist tracks.
+    """
+    # Find tracks from selected artists in scored list
+    artist_ids_set = set(artist_ids)
+    artist_tracks_scored = []
+    non_artist_tracks_in_results = []
+    
+    # Get track info to identify which are from selected artists
+    try:
+        result_track_ids = [uri.split(":")[-1] for uri in current_results]
+        result_tracks_info = sp.tracks(result_track_ids[:50])
+        
+        # Build map of which results are from selected artists
+        result_artist_map = {}
+        for track in result_tracks_info.get("tracks", []):
+            if not track:
+                continue
+            uri = track["uri"]
+            track_artist_ids = [a["id"] for a in track.get("artists", [])]
+            is_from_selected = any(aid in artist_ids_set for aid in track_artist_ids)
+            result_artist_map[uri] = is_from_selected
+            
+            if not is_from_selected:
+                non_artist_tracks_in_results.append(uri)
+        
+        # Count current artist tracks
+        current_artist_count = sum(1 for is_artist in result_artist_map.values() if is_artist)
+        
+        if current_artist_count >= min_count:
+            return current_results  # Already have enough
+        
+        needed = min_count - current_artist_count
+        print(f"[Artist] Need to add {needed} more tracks from selected artists")
+        
+        # Find high-scoring artist tracks not yet in results
+        for uri, score, features in scored_tracks:
+            if uri in current_results:
+                continue
+            
+            # Check if from selected artist
+            track_id = uri.split(":")[-1]
+            try:
+                track_info = sp.track(track_id)
+                track_artist_ids = [a["id"] for a in track_info.get("artists", [])]
+                if any(aid in artist_ids_set for aid in track_artist_ids):
+                    artist_tracks_scored.append((uri, score))
+            except:
+                continue
+        
+        # Replace lowest-scoring non-artist tracks with highest-scoring artist tracks
+        # Sort artist tracks by score (best first)
+        artist_tracks_scored.sort(key=lambda x: x[1], reverse=True)
+        
+        new_results = list(current_results)
+        replacements_made = 0
+        
+        for artist_uri, artist_score in artist_tracks_scored[:needed]:
+            if replacements_made >= needed:
+                break
+            
+            # Remove the last non-artist track (lowest position)
+            if non_artist_tracks_in_results:
+                removed_uri = non_artist_tracks_in_results.pop()
+                idx = new_results.index(removed_uri)
+                new_results[idx] = artist_uri
+                replacements_made += 1
+                print(f"[Artist] Replaced track with artist track (score {artist_score:.2f})")
+        
+        return new_results
+        
+    except Exception as e:
+        print(f"[Artist] Failed to force artist inclusion: {e}")
+        return current_results
 
 
 def _fetch_audio_features(sp: Spotify, track_uris: List[str]) -> Dict[str, dict]:
