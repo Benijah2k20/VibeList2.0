@@ -1,0 +1,9 @@
+Use this line for starting the catalog builder. Replace #### with the # of songs you want to add
+python -m backend.catalog_builder_v2 benijah ####
+
+Use this to add songs by a particular artists into catalog.
+python -m backend.catalog_artist_deep_dive benijah "Artist Name"
+
+Use this to show current status of catalog. Shows Top 10 artits (based on # of songs in catalog)
+python show_catalog.py
+
